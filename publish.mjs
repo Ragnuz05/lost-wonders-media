@@ -15,6 +15,9 @@ const IG_TOKEN = process.env.IG_ACCESS_TOKEN;
 const IG_USER = process.env.IG_USER_ID;
 const G = 'https://graph.facebook.com/v26.0';
 const LATE_LIMIT_H = 6; // a post more than this late is reported as missed instead of posted
+// TEST_POST_ID=<id>: runs that one post through hosting and Instagram processing, but never publishes
+// and leaves the queue untouched.
+const TEST_ID = process.env.TEST_POST_ID ? Number(process.env.TEST_POST_ID) : null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const gh = async (path, init = {}) => {
@@ -62,6 +65,7 @@ async function publish(post, video, staging) {
       if (i > 120) throw new Error('Instagram was still processing after 10 minutes; nothing was published.');
     }
     await remove(hosted);
+    if (TEST_ID) return { status: 'test', container: c.id };
     const pub = await ig(`/${IG_USER}/media_publish`, { creation_id: c.id });
     let url;
     try { url = (await ig(`/${pub.id}?fields=permalink`)).permalink; } catch { /* optional */ }
@@ -77,6 +81,16 @@ const staging = await release('Staging', { draft: false });
 const now = Date.now();
 const jobs = queue.assets.filter((a) => /^post-\d+\.json$/.test(a.name));
 console.log(`${jobs.length} queued post(s).`);
+
+if (TEST_ID) {
+  const meta = jobs.find((a) => a.name === `post-${TEST_ID}.json`);
+  const post = JSON.parse((await download(meta)).toString('utf8'));
+  const video = queue.assets.find((a) => a.name === `post-${post.id}.mp4`);
+  console.log(`TEST post ${post.id}:`, await publish(post, await download(video), staging));
+  const left = (await release('Staging', { draft: false })).assets.length;
+  console.log(`staging files left: ${left}`);
+  process.exit(0);
+}
 
 for (const meta of jobs) {
   const post = JSON.parse((await download(meta)).toString('utf8'));
