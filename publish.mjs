@@ -78,9 +78,15 @@ async function publish(post, video, staging) {
 const queue = await release('queue', { draft: true });
 if (!queue) { console.log('No queue release yet; nothing to do.'); process.exit(0); }
 const staging = await release('Staging', { draft: false });
-const now = Date.now();
 const jobs = queue.assets.filter((a) => /^post-\d+\.json$/.test(a.name));
 console.log(`${jobs.length} queued post(s).`);
+
+/** Stops the run, leaving the queue untouched, when the Instagram token doesn't work (posts then wait for a new token). */
+async function igReady() {
+  try { await ig(`/${IG_USER}?fields=username`); }
+  catch (e) { console.error(`Instagram token not working; nothing was touched, posts keep waiting. ${e.message}`); process.exit(1); }
+}
+if (jobs.length) await igReady();
 
 if (TEST_ID) {
   const meta = jobs.find((a) => a.name === `post-${TEST_ID}.json`);
@@ -92,29 +98,49 @@ if (TEST_ID) {
   process.exit(0);
 }
 
-for (const meta of jobs) {
-  const post = JSON.parse((await download(meta)).toString('utf8'));
-  const due = new Date(post.at).getTime();
-  if (due > now) { console.log(`post ${post.id}: due ${post.at}, waiting`); continue; }
-  const videoAsset = queue.assets.find((a) => a.name === `post-${post.id}.mp4`);
-  // Claim it first: once renamed, no later run picks it up again, even if this run dies halfway.
-  await gh(`/releases/assets/${meta.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `post-${post.id}.claimed.json` }) });
-  let result;
-  if (now - due > LATE_LIMIT_H * 3_600_000) {
-    result = { status: 'missed', error: `More than ${LATE_LIMIT_H} h late; not posted.` };
-  } else if (!videoAsset) {
-    result = { status: 'error', error: 'The video file is missing from the queue.' };
-  } else {
-    try {
-      console.log(`post ${post.id}: publishing`);
-      result = await publish(post, await download(videoAsset), staging);
-      console.log(`post ${post.id}: published ${result.url ?? ''}`);
-    } catch (e) {
-      console.log(`post ${post.id}: failed: ${e.message}`);
-      result = { status: 'error', error: e.message };
+// GitHub fires the 15-minute schedule only every few hours in practice, so a run that finds a post due
+// within MAX_WAIT stays up and publishes it on time (the job timeout is 350 min).
+const MAX_WAIT_MS = 5 * 3_600_000 + 20 * 60_000;
+const started = Date.now();
+
+/** Publishes every due post in the queue; returns the next due time still waiting (ms), if any. */
+async function runDue() {
+  const q = await release('queue', { draft: true });
+  let next = Infinity;
+  for (const meta of q.assets.filter((a) => /^post-\d+\.json$/.test(a.name))) {
+    const post = JSON.parse((await download(meta)).toString('utf8'));
+    const due = new Date(post.at).getTime();
+    if (due > Date.now()) { next = Math.min(next, due); console.log(`post ${post.id}: due ${post.at}, waiting`); continue; }
+    const videoAsset = q.assets.find((a) => a.name === `post-${post.id}.mp4`);
+    // Claim it first: once renamed, no later run picks it up again, even if this run dies halfway.
+    await gh(`/releases/assets/${meta.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `post-${post.id}.claimed.json` }) });
+    let result;
+    if (Date.now() - due > LATE_LIMIT_H * 3_600_000) {
+      result = { status: 'missed', error: `More than ${LATE_LIMIT_H} h late; not posted.` };
+    } else if (!videoAsset) {
+      result = { status: 'error', error: 'The video file is missing from the queue.' };
+    } else {
+      try {
+        console.log(`post ${post.id}: publishing`);
+        result = await publish(post, await download(videoAsset), staging);
+        console.log(`post ${post.id}: published ${result.url ?? ''}`);
+      } catch (e) {
+        console.log(`post ${post.id}: failed: ${e.message}`);
+        result = { status: 'error', error: e.message };
+      }
     }
+    await upload(q, `post-${post.id}.result.json`, JSON.stringify({ id: post.id, at: new Date().toISOString(), ...result }), 'application/json');
+    const fresh = await release('queue', { draft: true });
+    for (const a of fresh.assets.filter((a) => a.name === `post-${post.id}.claimed.json`)) await remove(a);
+    if (videoAsset) await remove(videoAsset);
   }
-  await upload(queue, `post-${post.id}.result.json`, JSON.stringify({ id: post.id, at: new Date().toISOString(), ...result }), 'application/json');
-  await remove(meta);
-  if (videoAsset) await remove(videoAsset);
+  return next;
+}
+
+for (;;) {
+  const next = await runDue();
+  if (next === Infinity || next - started > MAX_WAIT_MS) break;
+  console.log(`waiting until ${new Date(next).toISOString()} for the next post`);
+  await sleep(Math.max(0, next - Date.now()) + 5000);
+  await igReady();
 }
